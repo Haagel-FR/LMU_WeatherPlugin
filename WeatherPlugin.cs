@@ -1,19 +1,18 @@
-using GameReaderCommon;
-using Newtonsoft.Json.Linq;
-using SimHub.Plugins;
+﻿using SimHub.Plugins;
+using System;
 using System.Net.Http;
 using System.Threading.Tasks;
-using System.Windows.Controls;
-using System;
-
 using System.Timers;
+using Newtonsoft.Json.Linq;
+using System.Windows.Controls;
+using GameReaderCommon;
 
 namespace LMU_WeatherPlugin
 {
     [PluginDescription("LMU Weather Fetcher with Dynamic Node Properties")]
     [PluginAuthor("Giacomo Chiappe")]
     [PluginName("LMU_WeatherPlugin")]
-    public class WeatherPlugin : IPlugin, IDataPlugin, IWPFSettings
+    public class LMU_WeatherPlugin : IPlugin, IDataPlugin, IWPFSettings
     {
         private Timer _timer;
         private HttpClient _httpClient;
@@ -22,20 +21,15 @@ namespace LMU_WeatherPlugin
         private readonly string[] Nodes = new[] { "START", "NODE_25", "NODE_50", "NODE_75", "FINISH" };
         private readonly string[] Metrics = new[]
         {
-            "WNV_TEMPERATURE",
-            "WNV_WINDDIRECTION",
-            "WNV_RAIN_CHANCE",
-            "WNV_WINDSPEED",
-            "WNV_STARTTIME",
-            "WNV_SKY",
-            "WNV_DURATION",
-            "WNV_HUMIDITY"
+            "WNV_TEMPERATURE", "WNV_WINDDIRECTION", "WNV_RAIN_CHANCE", "WNV_WINDSPEED",
+            "WNV_STARTTIME", "WNV_SKY", "WNV_DURATION", "WNV_HUMIDITY"
         };
 
-        private string _currentSession = "RACE"; // Default fallback
+        private string _currentSession = "RACE";
         private JObject _weatherData;
         private int _currentSessionLengthMinutes = 0;
         private string _currentNode = "START";
+        private bool _timerRunning = false;
 
         public PluginManager PluginManager
         {
@@ -43,17 +37,13 @@ namespace LMU_WeatherPlugin
             set => _pluginManager = value;
         }
 
-        public WeatherPlugin()
-        {
-            // Constructor
-        }
+        public LMU_WeatherPlugin() { }
 
         public void Init(PluginManager pluginManager)
         {
             _pluginManager = pluginManager;
             _httpClient = new HttpClient();
 
-            // Attach base properties (by node)
             foreach (var node in Nodes)
             {
                 foreach (var metric in Metrics)
@@ -63,21 +53,19 @@ namespace LMU_WeatherPlugin
                 }
             }
 
-            // Attach session properties
             AttachDelegate("CurrentSessionLengthMinutes");
             AttachDelegate("CurrentNodeDurationMinutes");
 
-            // Attach CURRENTNODE dynamic properties
             foreach (var metric in Metrics)
             {
                 AttachDelegate($"CURRENTNODE_{metric}");
                 AttachDelegate($"CURRENTNODE_{metric}Str");
             }
 
-            // Timer to fetch updates
             _timer = new Timer(1000);
-            _timer.Elapsed += async (s, e) => await FetchWeather();
-            _timer.Start();
+            _timer.Elapsed += async (s, e) => await FetchWeather().ConfigureAwait(false);
+
+            SimHub.Logging.Current.Info("[LMU WeatherPlugin] Initialized successfully.");
         }
 
         private void AttachDelegate(string name)
@@ -85,106 +73,41 @@ namespace LMU_WeatherPlugin
             this.AttachDelegate(name, () => GetWeatherData(name));
         }
 
-        private object GetWeatherData(string name)
+        public void DataUpdate(PluginManager pluginManager, ref GameData data)
         {
-            if (name == "CurrentSessionLengthMinutes")
-            {
-                return _currentSessionLengthMinutes;
-            }
-            if (name == "CurrentNodeDurationMinutes")
-            {
-                return _currentSessionLengthMinutes / 5.0;
-            }
+            bool isLmu = false;
+            bool shouldRun = false;
 
-            if (name.StartsWith("CURRENTNODE_"))
+            try
             {
-                return GetCurrentNodeMetric(name);
+                isLmu = (data.GameName?.ToUpperInvariant() == "LMU");
+                shouldRun = data.GameRunning && !data.GameInMenu && !data.GamePaused && isLmu;
             }
-
-            if (_weatherData == null)
+            catch (Exception ex)
             {
-                if (name.EndsWith("Str")) return "";
-                else return 0.0;
+                SimHub.Logging.Current.Warn($"[LMU WeatherPlugin] DataUpdate check failed: {ex.Message}");
             }
 
-            var isStringValue = name.EndsWith("Str");
-            var cleanName = isStringValue ? name.Substring(0, name.Length - 3) : name;
-
-            var parts = cleanName.Split('_');
-            if (parts.Length < 2)
+            if (shouldRun)
             {
-                if (isStringValue) return "";
-                else return 0.0;
-            }
+                if (!_timerRunning)
+                {
+                    _timer.Start();
+                    _timerRunning = true;
+                    SimHub.Logging.Current.Info("[LMU WeatherPlugin] Game running (LMU) — started weather updates.");
+                }
 
-            string node;
-            string metric;
-
-            if (parts[0] == "NODE" && parts.Length >= 3)
-            {
-                node = $"{parts[0]}_{parts[1]}"; // NODE_25
-                metric = string.Join("_", parts, 2, parts.Length - 2);
+                _currentSession = data.NewData.SessionTypeName?.ToUpperInvariant() ?? "RACE";
+                UpdateCurrentNode(data.NewData.SessionTimeLeft);
             }
             else
             {
-                node = parts[0]; // START or FINISH
-                metric = string.Join("_", parts, 1, parts.Length - 1);
-            }
-
-            var nodeData = _weatherData?[node];
-            var metricData = nodeData?[metric];
-
-            if (metricData == null)
-            {
-                if (isStringValue) return "";
-                else return 0.0;
-            }
-
-            if (isStringValue)
-            {
-                return (string)metricData["stringValue"] ?? "";
-            }
-            else
-            {
-                return (double?)metricData["currentValue"] ?? 0.0;
-            }
-        }
-
-        private object GetCurrentNodeMetric(string name)
-        {
-            if (_weatherData == null)
-            {
-                if (name.EndsWith("Str")) return "";
-                else return 0.0;
-            }
-
-            if (string.IsNullOrEmpty(_currentNode))
-            {
-                if (name.EndsWith("Str")) return "";
-                else return 0.0;
-            }
-
-            var isStringValue = name.EndsWith("Str");
-            var cleanMetricName = isStringValue
-                ? name.Substring("CURRENTNODE_".Length, name.Length - "CURRENTNODE_".Length - 3)
-                : name.Substring("CURRENTNODE_".Length);
-
-            var nodeData = _weatherData[_currentNode];
-            var metricData = nodeData?[cleanMetricName];
-
-            if (metricData == null)
-            {
-                if (isStringValue) return "";
-                else return 0.0;
-            }
-
-            if (isStringValue)
-            {
-                return (string)metricData["stringValue"] ?? "";
-            }
-            else
-            {
-                return (double?)metricData["currentValue"] ?? 0.0;
+                if (_timerRunning)
+                {
+                    _timer.Stop();
+                    _timerRunning = false;
+                    SimHub.Logging.Current.Info("[LMU WeatherPlugin] Game not running or not LMU — stopped weather updates.");
+                }
             }
         }
 
@@ -228,45 +151,10 @@ namespace LMU_WeatherPlugin
             var apiName = apiSessionName.ToUpperInvariant();
             var internalName = internalSession.ToUpperInvariant();
 
-            if (internalName == "PRACTICE" && apiName.Contains("PRACTICE")) return true;
-            if (internalName == "QUALIFY" && apiName.Contains("QUALIFY")) return true;
-            if (internalName == "RACE" && apiName.Contains("RACE")) return true;
-
-            return false;
-        }
-
-        public void DataUpdate(PluginManager pluginManager, ref GameData data)
-        {
-            var sessionName = data.NewData.SessionTypeName?.ToUpperInvariant() ?? "RACE";
-
-            switch (sessionName)
-            {
-                case "PRACTICE":
-                case "FREEPRACTICE":
-                case "PRACTICE1":
-                case "PRACTICE2":
-                    _currentSession = "PRACTICE";
-                    break;
-
-                case "QUALIFY":
-                case "QUALIFYING":
-                case "QUALIFY1":
-                case "QUALIFY2":
-                    _currentSession = "QUALIFY";
-                    break;
-
-                case "RACE":
-                case "RACEMAIN":
-                    _currentSession = "RACE";
-                    break;
-
-                default:
-                    _currentSession = "RACE";
-                    break;
-            }
-
-            // Now directly pass TimeSpan!
-            UpdateCurrentNode(data.NewData.SessionTimeLeft);
+            return
+                (internalName == "PRACTICE" && apiName.Contains("PRACTICE")) ||
+                (internalName == "QUALIFY" && apiName.Contains("QUALIFY")) ||
+                (internalName == "RACE" && apiName.Contains("RACE"));
         }
 
         private void UpdateCurrentNode(TimeSpan sessionTimeLeft)
@@ -298,10 +186,101 @@ namespace LMU_WeatherPlugin
                 _currentNode = "FINISH";
         }
 
-        public Control GetWPFSettingsControl(PluginManager pluginManager)
+        private object GetWeatherData(string name)
         {
-            return null;
+            if (name == "CurrentSessionLengthMinutes")
+                return _currentSessionLengthMinutes;
+
+            if (name == "CurrentNodeDurationMinutes")
+                return _currentSessionLengthMinutes / 5.0;
+
+            if (name.StartsWith("CURRENTNODE_"))
+                return GetCurrentNodeMetric(name);
+
+            if (_weatherData == null)
+            {
+                if (name.EndsWith("Str"))
+                    return "";
+                else
+                    return 0.0;
+            }
+
+            var isStringValue = name.EndsWith("Str");
+            var cleanName = isStringValue ? name.Substring(0, name.Length - 3) : name;
+
+            var parts = cleanName.Split('_');
+            if (parts.Length < 2)
+            {
+                if (isStringValue)
+                    return "";
+                else
+                    return 0.0;
+            }
+
+            string node;
+            string metric;
+
+            if (parts[0] == "NODE" && parts.Length >= 3)
+            {
+                node = $"{parts[0]}_{parts[1]}";
+                metric = string.Join("_", parts, 2, parts.Length - 2);
+            }
+            else
+            {
+                node = parts[0];
+                metric = string.Join("_", parts, 1, parts.Length - 1);
+            }
+
+            var nodeData = _weatherData?[node];
+            var metricData = nodeData?[metric];
+
+            if (metricData == null)
+            {
+                if (isStringValue)
+                    return "";
+                else
+                    return 0.0;
+            }
+
+            if (isStringValue)
+                return (string)metricData["stringValue"] ?? "";
+            else
+                return (double?)metricData["currentValue"] ?? 0.0;
         }
+
+        private object GetCurrentNodeMetric(string name)
+        {
+            if (_weatherData == null || string.IsNullOrEmpty(_currentNode))
+            {
+                if (name.EndsWith("Str"))
+                    return "";
+                else
+                    return 0.0;
+            }
+
+            var isStringValue = name.EndsWith("Str");
+            var cleanMetricName = isStringValue
+                ? name.Substring("CURRENTNODE_".Length, name.Length - "CURRENTNODE_".Length - 3)
+                : name.Substring("CURRENTNODE_".Length);
+
+            var nodeData = _weatherData[_currentNode];
+            var metricData = nodeData?[cleanMetricName];
+
+            if (metricData == null)
+            {
+                if (isStringValue)
+                    return "";
+                else
+                    return 0.0;
+            }
+
+            if (isStringValue)
+                return (string)metricData["stringValue"] ?? "";
+            else
+                return (double?)metricData["currentValue"] ?? 0.0;
+        }
+
+        public Control GetWPFSettingsControl(PluginManager pluginManager) => null;
 
         public void End(PluginManager pluginManager)
         {
