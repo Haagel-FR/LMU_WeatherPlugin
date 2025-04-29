@@ -1,11 +1,12 @@
-﻿using SimHub.Plugins;
-using System;
+using GameReaderCommon;
+using Newtonsoft.Json.Linq;
+using SimHub.Plugins;
 using System.Net.Http;
 using System.Threading.Tasks;
-using System.Timers;
-using Newtonsoft.Json.Linq;
 using System.Windows.Controls;
-using GameReaderCommon;
+using System;
+
+using System.Timers;
 
 namespace LMU_WeatherPlugin
 {
@@ -15,7 +16,6 @@ namespace LMU_WeatherPlugin
     public class WeatherPlugin : IPlugin, IDataPlugin, IWPFSettings
     {
         private Timer _timer;
-        private Timer _gameMonitorTimer;
         private HttpClient _httpClient;
         private PluginManager _pluginManager;
 
@@ -74,75 +74,19 @@ namespace LMU_WeatherPlugin
                 AttachDelegate($"CURRENTNODE_{metric}Str");
             }
 
-            
-
-            _gameMonitorTimer = new Timer(1000); // Checks game state every second
-            _gameMonitorTimer.Elapsed += (s, e) => CheckGameState();
-            _gameMonitorTimer.Start();
-            CheckGameState();
-
-            _timer = new Timer(5000); // Weather fetch timer
+            // Timer to fetch updates
+            _timer = new Timer(1000);
             _timer.Elapsed += async (s, e) => await FetchWeather();
-            SimHub.Logging.Current.Info("[LMU WeatherPlugin] Game monitoring timer started.");
+            _timer.Start();
         }
 
         private void AttachDelegate(string name)
         {
-            SimHub.Logging.Current.Debug($"[LMU WeatherPlugin] Attaching delegate: {name}");
             this.AttachDelegate(name, () => GetWeatherData(name));
         }
 
-
-
-        private void CheckGameState()
-        {
-            try
-            {
-                var gameRunningValue = _pluginManager?.GetPropertyValue("GameRunning");
-                var currentGameValue = _pluginManager?.GetPropertyValue("CurrentGame");
-
-                if (gameRunningValue == null || currentGameValue == null)
-                {
-                    SimHub.Logging.Current.Debug("[LMU WeatherPlugin] GameRunning or CurrentGame is null.");
-                    return;
-                }
-
-                var isGameRunning = Convert.ToInt32(gameRunningValue) == 1;
-                var currentGame = Convert.ToString(currentGameValue)?.ToUpperInvariant();
-
-                SimHub.Logging.Current.Debug($"[LMU WeatherPlugin] GameRunning = {isGameRunning}, CurrentGame = {currentGame}");
-
-                if (isGameRunning && currentGame == "LMU")
-                {
-                    if (!_timer.Enabled)
-                    {
-                        _timer.Start();
-                        SimHub.Logging.Current.Info("[LMU WeatherPlugin] Game is LMU and running — starting weather updates.");
-                    }
-                }
-                else
-                {
-                    if (_timer.Enabled)
-                    {
-                        _timer.Stop();
-                        SimHub.Logging.Current.Info("[LMU WeatherPlugin] Game not LMU or not running — stopping weather updates.");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                SimHub.Logging.Current.Error($"[LMU WeatherPlugin] Error in game state check: {ex.Message}");
-            }
-        }
-
-
-
-
-
         private object GetWeatherData(string name)
         {
-            SimHub.Logging.Current.Debug($"[LMU WeatherPlugin] Requested property: {name}");
-
             if (name == "CurrentSessionLengthMinutes")
             {
                 return _currentSessionLengthMinutes;
@@ -159,8 +103,6 @@ namespace LMU_WeatherPlugin
 
             if (_weatherData == null)
             {
-                SimHub.Logging.Current.Warn($"[LMU WeatherPlugin] Weather data is null when accessing: {name}");
-
                 if (name.EndsWith("Str")) return "";
                 else return 0.0;
             }
@@ -194,8 +136,6 @@ namespace LMU_WeatherPlugin
 
             if (metricData == null)
             {
-                SimHub.Logging.Current.Warn($"[LMU WeatherPlugin] Metric '{metric}' not found under node '{node}'");
-
                 if (isStringValue) return "";
                 else return 0.0;
             }
@@ -252,16 +192,12 @@ namespace LMU_WeatherPlugin
         {
             try
             {
-                SimHub.Logging.Current.Info($"[LMU WeatherPlugin] Fetching weather for session: {_currentSession}");
-
                 var urlWeather = $"http://localhost:6397/rest/sessions/weather/{_currentSession}";
                 var responseWeather = await _httpClient.GetStringAsync(urlWeather);
-                SimHub.Logging.Current.Debug($"[LMU WeatherPlugin] Weather response: {responseWeather}");
                 _weatherData = JObject.Parse(responseWeather);
 
                 var urlSessions = "http://localhost:6397/rest/sessions/GetSessionsInfoForEvent";
                 var responseSessions = await _httpClient.GetStringAsync(urlSessions);
-                SimHub.Logging.Current.Debug($"[LMU WeatherPlugin] Session info response: {responseSessions}");
                 var sessionInfo = JObject.Parse(responseSessions);
 
                 var scheduledSessions = sessionInfo["scheduledSessions"];
@@ -273,19 +209,14 @@ namespace LMU_WeatherPlugin
                         if (IsMatchingSessionName(name, _currentSession))
                         {
                             _currentSessionLengthMinutes = (int?)session["lengthTime"] ?? 0;
-                            SimHub.Logging.Current.Info($"[LMU WeatherPlugin] Found session length: {_currentSessionLengthMinutes} minutes");
                             break;
                         }
                     }
                 }
-                else
-                {
-                    SimHub.Logging.Current.Warn("[LMU WeatherPlugin] scheduledSessions is null — session length not updated.");
-                }
             }
             catch (Exception ex)
             {
-                SimHub.Logging.Current.Error($"[LMU WeatherPlugin] Failed to fetch weather data: {ex.Message}\n{ex.StackTrace}");
+                SimHub.Logging.Current.Error($"[LMU WeatherPlugin] Failed to fetch weather data: {ex.Message}");
             }
         }
 
@@ -306,51 +237,37 @@ namespace LMU_WeatherPlugin
 
         public void DataUpdate(PluginManager pluginManager, ref GameData data)
         {
-            try
+            var sessionName = data.NewData.SessionTypeName?.ToUpperInvariant() ?? "RACE";
+
+            switch (sessionName)
             {
-                if (pluginManager == null || data?.NewData == null)
-                    return;
+                case "PRACTICE":
+                case "FREEPRACTICE":
+                case "PRACTICE1":
+                case "PRACTICE2":
+                    _currentSession = "PRACTICE";
+                    break;
 
-                var sessionName = data.NewData.SessionTypeName?.ToUpperInvariant() ?? "RACE";
+                case "QUALIFY":
+                case "QUALIFYING":
+                case "QUALIFY1":
+                case "QUALIFY2":
+                    _currentSession = "QUALIFY";
+                    break;
 
-                switch (sessionName)
-                {
-                    case "PRACTICE":
-                    case "FREEPRACTICE":
-                    case "PRACTICE1":
-                    case "PRACTICE2":
-                        _currentSession = "PRACTICE";
-                        break;
+                case "RACE":
+                case "RACEMAIN":
+                    _currentSession = "RACE";
+                    break;
 
-                    case "QUALIFY":
-                    case "QUALIFYING":
-                    case "QUALIFY1":
-                    case "QUALIFY2":
-                        _currentSession = "QUALIFY";
-                        break;
-
-                    case "RACE":
-                    case "RACEMAIN":
-                        _currentSession = "RACE";
-                        break;
-
-                    default:
-                        _currentSession = "RACE";
-                        break;
-                }
-
-                // Ensure SessionTimeLeft is valid
-                if (data.NewData.SessionTimeLeft != null)
-                {
-                    UpdateCurrentNode(data.NewData.SessionTimeLeft);
-                }
+                default:
+                    _currentSession = "RACE";
+                    break;
             }
-            catch (Exception ex)
-            {
-                SimHub.Logging.Current.Error($"[LMU WeatherPlugin] Error in DataUpdate: {ex.Message}");
-            }
+
+            // Now directly pass TimeSpan!
+            UpdateCurrentNode(data.NewData.SessionTimeLeft);
         }
-
 
         private void UpdateCurrentNode(TimeSpan sessionTimeLeft)
         {
@@ -390,11 +307,8 @@ namespace LMU_WeatherPlugin
         {
             _timer?.Stop();
             _timer?.Dispose();
-            _gameMonitorTimer?.Stop();
-            _gameMonitorTimer?.Dispose();
             _httpClient?.Dispose();
             SimHub.Logging.Current.Info("[LMU WeatherPlugin] Plugin has been stopped.");
         }
-
     }
 }
