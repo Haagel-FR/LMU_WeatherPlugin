@@ -1,4 +1,4 @@
-﻿using SimHub.Plugins;
+using SimHub.Plugins;
 using System;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -10,7 +10,7 @@ using GameReaderCommon;
 namespace LMU_WeatherPlugin
 {
     [PluginDescription("LMU Weather Fetcher with Dynamic Node Properties")]
-    [PluginAuthor("Giacomo Chiappe")]
+    [PluginAuthor("geims12")]
     [PluginName("LMU_WeatherPlugin")]
     public class LMU_WeatherPlugin : IPlugin, IDataPlugin, IWPFSettings
     {
@@ -30,14 +30,13 @@ namespace LMU_WeatherPlugin
         private int _currentSessionLengthMinutes = 0;
         private string _currentNode = "START";
         private bool _timerRunning = false;
+        private TimeSpan _lastSessionTimeLeft = TimeSpan.Zero;
 
         public PluginManager PluginManager
         {
             get => _pluginManager;
             set => _pluginManager = value;
         }
-
-        public LMU_WeatherPlugin() { }
 
         public void Init(PluginManager pluginManager)
         {
@@ -55,12 +54,18 @@ namespace LMU_WeatherPlugin
 
             AttachDelegate("CurrentSessionLengthMinutes");
             AttachDelegate("CurrentNodeDurationMinutes");
+            AttachDelegate("CurrentNodeName");
 
             foreach (var metric in Metrics)
             {
                 AttachDelegate($"CURRENTNODE_{metric}");
                 AttachDelegate($"CURRENTNODE_{metric}Str");
             }
+
+            AttachDelegate("TimeUntil_NODE_25");
+            AttachDelegate("TimeUntil_NODE_50");
+            AttachDelegate("TimeUntil_NODE_75");
+            AttachDelegate("TimeUntil_FINISH");
 
             _timer = new Timer(1000);
             _timer.Elapsed += async (s, e) => await FetchWeather().ConfigureAwait(false);
@@ -98,7 +103,8 @@ namespace LMU_WeatherPlugin
                 }
 
                 _currentSession = data.NewData.SessionTypeName?.ToUpperInvariant() ?? "RACE";
-                UpdateCurrentNode(data.NewData.SessionTimeLeft);
+                _lastSessionTimeLeft = data.NewData.SessionTimeLeft;
+                UpdateCurrentNode(_lastSessionTimeLeft);
             }
             else
             {
@@ -143,20 +149,6 @@ namespace LMU_WeatherPlugin
             }
         }
 
-        private bool IsMatchingSessionName(string apiSessionName, string internalSession)
-        {
-            if (string.IsNullOrEmpty(apiSessionName) || string.IsNullOrEmpty(internalSession))
-                return false;
-
-            var apiName = apiSessionName.ToUpperInvariant();
-            var internalName = internalSession.ToUpperInvariant();
-
-            return
-                (internalName == "PRACTICE" && apiName.Contains("PRACTICE")) ||
-                (internalName == "QUALIFY" && apiName.Contains("QUALIFY")) ||
-                (internalName == "RACE" && apiName.Contains("RACE"));
-        }
-
         private void UpdateCurrentNode(TimeSpan sessionTimeLeft)
         {
             if (_currentSessionLengthMinutes <= 0)
@@ -188,21 +180,20 @@ namespace LMU_WeatherPlugin
 
         private object GetWeatherData(string name)
         {
-            if (name == "CurrentSessionLengthMinutes")
-                return _currentSessionLengthMinutes;
+            if (name == "CurrentSessionLengthMinutes") return _currentSessionLengthMinutes;
+            if (name == "CurrentNodeDurationMinutes") return _currentSessionLengthMinutes / 5.0;
+            if (name == "CurrentNodeName") return _currentNode;
 
-            if (name == "CurrentNodeDurationMinutes")
-                return _currentSessionLengthMinutes / 5.0;
+            if (name.StartsWith("TimeUntil_"))
+                return GetTimeUntilNode(name.Substring("TimeUntil_".Length));
 
             if (name.StartsWith("CURRENTNODE_"))
                 return GetCurrentNodeMetric(name);
 
             if (_weatherData == null)
             {
-                if (name.EndsWith("Str"))
-                    return "";
-                else
-                    return 0.0;
+                if (name.EndsWith("Str")) return "";
+                else return 0.0;
             }
 
             var isStringValue = name.EndsWith("Str");
@@ -211,10 +202,8 @@ namespace LMU_WeatherPlugin
             var parts = cleanName.Split('_');
             if (parts.Length < 2)
             {
-                if (isStringValue)
-                    return "";
-                else
-                    return 0.0;
+                if (isStringValue) return "";
+                else return 0.0;
             }
 
             string node;
@@ -236,10 +225,8 @@ namespace LMU_WeatherPlugin
 
             if (metricData == null)
             {
-                if (isStringValue)
-                    return "";
-                else
-                    return 0.0;
+                if (isStringValue) return "";
+                else return 0.0;
             }
 
             if (isStringValue)
@@ -252,10 +239,8 @@ namespace LMU_WeatherPlugin
         {
             if (_weatherData == null || string.IsNullOrEmpty(_currentNode))
             {
-                if (name.EndsWith("Str"))
-                    return "";
-                else
-                    return 0.0;
+                if (name.EndsWith("Str")) return "";
+                else return 0.0;
             }
 
             var isStringValue = name.EndsWith("Str");
@@ -268,16 +253,50 @@ namespace LMU_WeatherPlugin
 
             if (metricData == null)
             {
-                if (isStringValue)
-                    return "";
-                else
-                    return 0.0;
+                if (isStringValue) return "";
+                else return 0.0;
             }
 
             if (isStringValue)
                 return (string)metricData["stringValue"] ?? "";
             else
                 return (double?)metricData["currentValue"] ?? 0.0;
+        }
+
+        private double GetTimeUntilNode(string nodeName)
+        {
+            if (_currentSessionLengthMinutes <= 0 || _lastSessionTimeLeft.TotalMinutes <= 0)
+                return 0.0;
+
+            double nodeStart = 0.0;
+            switch (nodeName)
+            {
+                case "NODE_25": nodeStart = 0.25; break;
+                case "NODE_50": nodeStart = 0.50; break;
+                case "NODE_75": nodeStart = 0.75; break;
+                case "FINISH": nodeStart = 1.00; break;
+                default: return 0.0;
+            }
+
+            double elapsedMinutes = _currentSessionLengthMinutes - _lastSessionTimeLeft.TotalMinutes;
+            double nodeStartTime = _currentSessionLengthMinutes * nodeStart;
+
+            double minutesLeft = nodeStartTime - elapsedMinutes;
+            return minutesLeft > 0 ? minutesLeft : 0.0;
+        }
+
+        private bool IsMatchingSessionName(string apiSessionName, string internalSession)
+        {
+            if (string.IsNullOrEmpty(apiSessionName) || string.IsNullOrEmpty(internalSession))
+                return false;
+
+            var apiName = apiSessionName.ToUpperInvariant();
+            var internalName = internalSession.ToUpperInvariant();
+
+            return
+                (internalName == "PRACTICE" && apiName.Contains("PRACTICE")) ||
+                (internalName == "QUALIFY" && apiName.Contains("QUALIFY")) ||
+                (internalName == "RACE" && apiName.Contains("RACE"));
         }
 
         public Control GetWPFSettingsControl(PluginManager pluginManager) => null;
